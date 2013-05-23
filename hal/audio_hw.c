@@ -76,6 +76,7 @@
 #include "audio_extn.h"
 #include "voice_extn.h"
 #include "ip_hdlr_intf.h"
+#include "audio_amplifier.h"
 #include "ultrasound.h"
 
 #include "sound/compress_params.h"
@@ -1561,6 +1562,7 @@ int enable_snd_device(struct audio_device *adev,
             goto err;
         }
         audio_extn_dev_arbi_acquire(snd_device);
+        amplifier_enable_devices(snd_device, true);
         audio_route_apply_and_update_path(adev->audio_route, device_name);
 
         if (SND_DEVICE_OUT_HEADPHONES == snd_device &&
@@ -1633,6 +1635,7 @@ int disable_snd_device(struct audio_device *adev,
             platform_set_speaker_gain_in_combo(adev, snd_device, false);
         } else {
             audio_route_reset_and_update_path(adev->audio_route, device_name);
+            amplifier_enable_devices(snd_device, false);
         }
 
         if (snd_device == SND_DEVICE_OUT_BT_A2DP) {
@@ -3163,6 +3166,10 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
             voice_set_sidetone(adev, out_snd_device, true);
     }
 
+    /* Rely on amplifier_set_devices to distinguish between in/out devices */
+    amplifier_set_input_devices(in_snd_device);
+    amplifier_set_output_devices(out_snd_device);
+
     /* Applicable only on the targets that has external modem.
      * Enable device command should be sent to modem only after
      * enabling voice call mixer controls
@@ -4675,6 +4682,9 @@ static int out_standby(struct audio_stream *stream)
         }
 
         pthread_mutex_lock(&adev->lock);
+
+        amplifier_output_stream_standby((struct audio_stream_out *) stream);
+
         out->standby = true;
         if (out->usecase == USECASE_COMPRESS_VOIP_CALL) {
             voice_extn_compress_voip_close_output_stream(stream);
@@ -5169,6 +5179,8 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
     parms = str_parms_create_str(kvpairs);
     if (!parms)
         goto error;
+
+    amplifier_out_set_parameters(parms);
 
     err = platform_get_controller_stream_from_params(parms, &ext_controller,
                                                        &ext_stream);
@@ -6031,6 +6043,11 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
             ret = voice_extn_compress_voip_start_output_stream(out);
         else
             ret = start_output_stream(out);
+
+        if (ret == 0)
+            amplifier_output_stream_start(stream,
+                    is_offload_usecase(out->usecase));
+
         /* ToDo: If use case is compress offload should return 0 */
         if (ret != 0) {
             out->standby = true;
@@ -6936,6 +6953,9 @@ static int in_standby(struct audio_stream *stream)
             adev->adm_deregister_stream(adev->adm_data, in->capture_handle);
 
         pthread_mutex_lock(&adev->lock);
+
+        amplifier_input_stream_standby((struct audio_stream_in *) stream);
+
         in->standby = true;
         if (in->usecase == USECASE_COMPRESS_VOIP_CALL) {
             do_stop = false;
@@ -7119,6 +7139,9 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
 
     if (!parms)
         goto error;
+
+    amplifier_in_set_parameters(parms);
+
     lock_input_stream(in);
     pthread_mutex_lock(&adev->lock);
 
@@ -7267,6 +7290,10 @@ static ssize_t in_read(struct audio_stream_in *stream, void *buffer,
             if (adev->num_va_sessions < UINT_MAX)
                 adev->num_va_sessions++;
         }
+
+        if (ret == 0)
+            amplifier_input_stream_start(stream);
+
         pthread_mutex_unlock(&adev->lock);
         if (ret != 0) {
             goto exit;
@@ -9126,6 +9153,7 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
         }
     }
 
+    amplifier_set_parameters(parms);
     audio_extn_set_parameters(adev, parms);
 done:
     str_parms_destroy(parms);
@@ -9253,6 +9281,8 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
     pthread_mutex_lock(&adev->lock);
     if (adev->mode != mode) {
         ALOGD("%s: mode %d , prev_mode %d \n", __func__, mode , adev->mode);
+        if (amplifier_set_mode(mode) != 0)
+            ALOGE("Failed setting amplifier mode");
         adev->prev_mode = adev->mode; /* prev_mode is kept to handle voip concurrency*/
         adev->mode = mode;
         if (mode == AUDIO_MODE_CALL_SCREEN) {
@@ -10426,6 +10456,8 @@ static int adev_close(hw_device_t *device)
     if ((--audio_device_ref_count) == 0) {
          if (audio_extn_spkr_prot_is_enabled())
              audio_extn_spkr_prot_deinit();
+        if (amplifier_close() != 0)
+            ALOGE("Amplifier close failed");
         audio_extn_battery_properties_listener_deinit();
         audio_extn_snd_mon_unregister_listener(adev);
         audio_extn_sound_trigger_deinit(adev);
@@ -10867,6 +10899,9 @@ static int adev_open(const hw_module_t *module, const char *name,
     adev->vr_audio_mode_enabled = false;
 
     audio_extn_ds2_enable(adev);
+
+    if (amplifier_open(adev) != 0)
+        ALOGE("Amplifier initialization failed");
 
     us_init(adev);
 
